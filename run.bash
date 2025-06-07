@@ -17,5 +17,5 @@ for emo in surprise joy sadness; do
 done
 
 # 终端运行：
-# chmod +x run.bash 赋执行权限（只需一次）
+# chmod +x run.bash #赋执行权限（只需一次）
 # ./run.bash

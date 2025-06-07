@@ -29,16 +29,27 @@ else:
 #     max_length=args.max_source_length + args.prompt_len + 1,
 #     use_fast=False
 # )
+
+# tokenizer = AutoTokenizer.from_pretrained(
+#     args.backbone,
+#     use_fast=False
+# )
 tokenizer = AutoTokenizer.from_pretrained(
-    args.backbone,
+    "model/roberta-base",
     use_fast=False
 )
 
 # config = AutoConfig.from_pretrained(args.backbone)
 # config.mask_token_id = tokenizer.mask_token_id
 
+# model = RobertaForMaskedLMPrompt.from_pretrained(
+#     args.backbone,
+#     prompt_len=args.prompt_len,
+#     num_labels=2
+# )
+
 model = RobertaForMaskedLMPrompt.from_pretrained(
-    args.backbone,
+    "model/roberta-base",
     prompt_len=args.prompt_len,
     num_labels=2
 )

@@ -33,7 +33,16 @@ class ModelEmotionTrainer(Trainer):
         return train_dataloader
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
-        eval_dataset = EmotionDataset(self.args.sentiment, self.tokenizer, self.args.max_source_length, self.args.seed, 'dev',self.args.prompt_len)
+        # eval_dataset = EmotionDataset(self.args.sentiment, self.tokenizer, self.args.max_source_length, self.args.seed, 'dev',self.args.prompt_len)
+        eval_dataset = EmotionDataset(
+            sentiment=self.args.sentiment,
+            tokenizer=self.tokenizer,
+            seed=self.args.seed,
+            split='dev',
+            prompt_len=self.args.prompt_len,
+            max_source_length=self.args.max_source_length,
+            root='data'
+        )
 
         validation_dataloader = DataLoader(
             dataset=eval_dataset, 
