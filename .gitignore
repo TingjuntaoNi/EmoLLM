@@ -4,3 +4,6 @@ outputs/
 
 # Ignore macOS system files
 .DS_Store
+
+# 忽略 pycache 文件夹
+__pycache__/
