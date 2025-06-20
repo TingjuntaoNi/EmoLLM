@@ -15,6 +15,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput, MaskedLMOutp
 from transformers.models.roberta.modeling_roberta import RobertaPooler
 
 
+# 将 Prompt 嵌入整合到 RoBERTa 模型中，并实现基于 Masked Language Modeling (MLM) 的逻辑，同时支持情感分类任务的定制逻辑
 class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
     _keys_to_ignore_on_save = [r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
     _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.weight", r"lm_head.decoder.bias"]
@@ -23,32 +24,38 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
     def __init__(self, config, prompt_len=100, init_ids=None):
         super().__init__(config)
 
-        self.prompt_len = prompt_len
+        self.prompt_len = prompt_len # Prompt 的长度，表示提示 Token 的数量
 
         self.roberta = RobertaModelWarp(config, prompt_len, init_ids, add_pooling_layer=False)
-        self.lm_head = RobertaLMHead(config)
+        self.lm_head = RobertaLMHead(config) # 用来预测 [MASK] 的内容
 
-        self.mask_token_id = getattr(config, "mask_token_id", 50264)
+        self.mask_token_id = getattr(config, "mask_token_id", 50264) # 默认值为 50264，它是 [MASK] 的索引
 
         # The LM head weights require special treatment only when they are tied with the word embeddings
-        # self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
+        #self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
 
         # Initialize weights and apply final processing
         self.post_init()
 
-        self.freeze_lm()
+        self.freeze_lm() # 只允许 Prompt 嵌入部分的权重更新，避免优化 RoBERTa 主体部分
 
+    # 冻结权重
     def freeze_lm(self):
         for name, param in self.named_parameters():
             if not 'prompt_embedding' in name:
                 param.requires_grad = False
 
+    # 嵌入操作
+    ## 获取输出嵌入
     def get_output_embeddings(self):
         return self.lm_head.decoder
 
+    ## 设置输出嵌入
     def set_output_embeddings(self, new_embeddings):
         self.lm_head.decoder = new_embeddings
 
+    
+    # 前向传播
     def forward(
         self,
         input_ids=None,
@@ -66,6 +73,7 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         mask_id=50264,
     ):
 
+        # 处理 Attention Mask
         if attention_mask is not None:
             device = attention_mask.device
         elif input_ids is not None:
@@ -82,7 +90,8 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
         
-        # 1. 原始 embedding
+        # 嵌入拼接
+        ## 原始 embedding
         text_embeds = self.roberta.embeddings.word_embeddings(input_ids)
         prompt_embeds = self.roberta.embeddings.prompt_embeddings(
             torch.arange(self.prompt_len, device=device).unsqueeze(0).expand(batch_size, -1)
@@ -91,22 +100,23 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
             torch.full((batch_size, 1), self.mask_token_id, dtype=torch.long, device=device)
         )
 
-        # 4. 拼 embedding
+        
         inputs_embeds = torch.cat([
-            text_embeds[:, :1, :],  # [CLS]
-            prompt_embeds,
-            mask_embeds,
-            text_embeds[:, 1:, :]   # [原文]
+            text_embeds[:, :1, :],  # 原始文本 "[CLS]"
+            prompt_embeds, # Prompt 嵌入
+            mask_embeds, # Mask Token 嵌入
+            text_embeds[:, 1:, :]  # 原始文本的其他部分
         ], dim=1)
 
-        # 5. 拼 attention_mask
+        ## 注意力掩码拼接
+        ### 添加与 Prompt 和 [MASK] 对应的注意力掩码
         prompt_mask = torch.ones(batch_size, self.prompt_len, device=device)
         mask_mask   = torch.ones(batch_size, 1, device=device)
         attention_mask = torch.cat([prompt_mask, mask_mask, attention_mask], dim=1)
 
-        print("text_embeds:", text_embeds.shape)        # 应该是 (B, 128, 768)
-        print("inputs_embeds:", inputs_embeds.shape)    # 应该是 (B, 229, 768)
-        print("attention_mask:", attention_mask.shape)  # 应该是 (B, 229)
+        # print("text_embeds:", text_embeds.shape)        # 应该是 (B, 128, 768)
+        # print("inputs_embeds:", inputs_embeds.shape)    # 应该是 (B, 229, 768)
+        # print("attention_mask:", attention_mask.shape)  # 应该是 (B, 229)
 
         # ## Add <MASK> to input_ids
         outputs = self.roberta(
@@ -116,15 +126,18 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         )
 
         sequence_output = outputs[0]
-        prediction_scores = self.lm_head(sequence_output)
+        prediction_scores = self.lm_head(sequence_output) # (batch_size, sequence_length, vocab_size)
 
+        # 分类逻辑
         # "positive":22173, "negative":33407
         # "yes":10932, "no":2362
         # '1': 134, '-': 12
         # 'true': 29225, 'false': 22303
-        mask_logits = prediction_scores[:, 0, :]
+        mask_position = 1 + self.prompt_len
+        mask_logits = prediction_scores[:, mask_position, :]
         logits = torch.cat([mask_logits[:, 33407].unsqueeze(1), mask_logits[:, 22173].unsqueeze(1)], dim=1)
 
+        # 损失计算
         masked_lm_loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
@@ -141,6 +154,8 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
             # attentions=outputs.attentions,
         )
 
+# 自定义的语言模型头（Language Model Head）类
+## 只保留了 dense 层和 layer_norm 层，而省去了解码层（即将隐层表示映射到词表 logits 的部分）
 class RobertaLMHeadWarp(nn.Module):
     """WARP Roberta LM Head without last decoder layer."""
 
@@ -155,6 +170,7 @@ class RobertaLMHeadWarp(nn.Module):
         x = self.layer_norm(x)
 
         return x
+
 
 class RobertaWarp(RobertaPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids", r"lm_head.decoder.bias"]
