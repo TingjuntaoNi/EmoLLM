@@ -23,6 +23,7 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         super().__init__(config)
 
         self.prompt_len = prompt_len
+        self.prompt_token_id = init_ids
 
         self.roberta = RobertaModelWarp(config, prompt_len, init_ids, add_pooling_layer=False)
         self.lm_head = RobertaLMHead(config)
@@ -64,52 +65,55 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        batch_size = input_ids.shape[0]
         device = input_ids.device
-        batch_size, orig_seq_len = input_ids.shape
         
-        ## Add <MASK> to input_ids
-        prompt_ids = torch.full((batch_size, self.prompt_len), 0, dtype=torch.long, device=input_ids.device)  # 占位
-        mask_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=input_ids.device)
-        input_ids = torch.cat([prompt_ids, mask_ids, input_ids], dim=1)
         
-        ## Add prefix to attention_mask
-        prompt_attention_mask = torch.ones(batch_size, self.prompt_len, dtype=torch.long, device=device)
-        mask_attention_mask   = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-        attention_mask = torch.cat([prompt_attention_mask, mask_attention_mask, attention_mask], dim=1)
+        # 1. 获取原始文本和 MASK 的 embedding
+        mask_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
+        # text_ids 就是原始的 input_ids
+        combined_ids = torch.cat([mask_ids, input_ids], dim=1)
+        raw_embeds = self.roberta.embeddings.word_embeddings(combined_ids) # Shape: [B, 1 + text_len, H]
 
+        # 2. 获取 prompt embedding
+        prompt_ids = torch.arange(self.prompt_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        prompt_embeds = self.roberta.embeddings.prompt_embedding(prompt_ids) # Shape: [B, prompt_len, H]
 
-        # token_type_ids 补全 0（Roberta 不用 token_type，但还是要传同样长度）
-        if token_type_ids is not None:
-            prefix_token_type_ids = torch.zeros(batch_size, self.prompt_len + 1, dtype=torch.long, device=device)
-            token_type_ids = torch.cat([prefix_token_type_ids, token_type_ids], dim=1)
-        
-              
-        # position_ids 补全位置编号
-        if position_ids is None:
-            full_seq_len = self.prompt_len + 1 + orig_seq_len
-            position_ids = torch.arange(full_seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        
-        # === 4. sanity check ===
-        assert input_ids.shape[1] == attention_mask.shape[1], f"input_ids and attention_mask mismatch: {input_ids.shape[1]} vs {attention_mask.shape[1]}"
-        if token_type_ids is not None:
-            assert token_type_ids.shape[1] == input_ids.shape[1], f"token_type_ids mismatch: {token_type_ids.shape[1]} vs {input_ids.shape[1]}"
-        assert position_ids.shape[1] == input_ids.shape[1], f"position_ids mismatch: {position_ids.shape[1]} vs {input_ids.shape[1]}"
+        # 3. 按照 [prompt, MASK, text] 的顺序拼接 embeddings
+        # MASK 和 text 的 embedding 已经合在一起了
+        inputs_embeds = torch.cat([prompt_embeds, raw_embeds], dim=1) # Shape: [B, prompt_len + 1 + text_len, H]
 
-        # === 5. debug 打印 ===
-        print("Final shapes → input_ids:", input_ids.shape, 
-            "attention_mask:", attention_mask.shape, 
-            "token_type_ids:", token_type_ids.shape if token_type_ids is not None else None,
-            "position_ids:", position_ids.shape)
+        # 4. 扩展 attention_mask
+        prompt_mask = torch.ones(batch_size, self.prompt_len, dtype=attention_mask.dtype, device=device)
+        mask_token_mask = torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=device)
+        # 拼接成 [prompt_mask, mask_token_mask, original_text_mask]
+        extended_attention_mask = torch.cat([prompt_mask, mask_token_mask, attention_mask], dim=1)
+        
+        
+        # # 只对非 None 的张量做 sanity-check
+        # assert input_ids.shape[1] == attention_mask.shape[1], \
+        #     f"input_ids vs attention_mask: {input_ids.shape[1]} vs {attention_mask.shape[1]}"
+        # if token_type_ids is not None:
+        #     assert token_type_ids.shape[1] == input_ids.shape[1], \
+        #         f"token_type_ids mismatch: {token_type_ids.shape[1]} vs {input_ids.shape[1]}"
+        # if position_ids is not None:
+        #     assert position_ids.shape[1] == input_ids.shape[1], \
+        #         f"position_ids mismatch: {position_ids.shape[1]} vs {input_ids.shape[1]}"
+
+        # # debug 打印也要判空
+        # print("Final shapes → input_ids:", input_ids.shape,
+        #     "attention_mask:", attention_mask.shape,
+        #     "token_type_ids:", token_type_ids.shape if token_type_ids is not None else None,
+        #     "position_ids:", position_ids.shape if position_ids is not None else None)
         
         
         outputs = self.roberta(
-            input_ids,
-            attention_mask=attention_mask,
+            input_ids=None,
+            attention_mask=extended_attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
-            inputs_embeds=None,
+            inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             output_attentions=output_attentions,
@@ -290,51 +294,13 @@ class RobertaEmbeddingsWarp(RobertaEmbeddings):
     def forward(
         self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
     ):
-        batch_size, seq_length = input_ids.shape
-        
-        ## Create position_ids for prompt
-        if position_ids is None:
-            if input_ids is not None:
-                # Create the position ids from the input token ids. Any padded tokens remain padded.
-                input_ids_prefix = torch.zeros((self.prompt_len)).repeat(batch_size, 1).to(input_ids.device) + 10 # make the prompt ids != pad id
-                position_ids = create_position_ids_from_input_ids(
-                    torch.cat([input_ids_prefix, input_ids], dim=1), self.padding_idx, past_key_values_length)
-            else:
-                position_ids = self.create_position_ids_from_inputs_embeds(inputs_embeds)
-
-        if input_ids is not None:
-            input_shape = input_ids.size()
-        else:
-            input_shape = inputs_embeds.size()[:-1]
-
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
-        if token_type_ids is None:
-            if hasattr(self, "token_type_ids"):
-                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
-        inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
-        embeddings = inputs_embeds + token_type_embeddings                # → [B, seq_len, H]
-
-        # 插入 prompt
-        prompt_ids = torch.arange(self.prompt_len).repeat(batch_size, 1).to(input_ids.device)
-        prompt_embedding = self.prompt_embedding(prompt_ids)              # → [B, prompt_len, H]
-        embeddings = torch.cat([embeddings[:, :1, :], prompt_embedding, embeddings[:, 1:, :]], dim=1)
-
-        # 加 positional embedding（！！关键点在这里！！）
-        position_ids = torch.arange(embeddings.shape[1], dtype=torch.long, device=embeddings.device).unsqueeze(0).expand(batch_size, -1)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings += position_embeddings
-
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-        return embeddings
+        return super().forward(
+        input_ids=input_ids, 
+        token_type_ids=token_type_ids, 
+        position_ids=position_ids, 
+        inputs_embeds=inputs_embeds, 
+        past_key_values_length=past_key_values_length
+    )
 
 class RobertaModelWarp(RobertaModel):
     """

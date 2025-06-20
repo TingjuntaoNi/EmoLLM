@@ -1,5 +1,6 @@
 import sys
 import os
+import torch
 # from transformers import tokenizer
 from transformers import AutoTokenizer
 from framework.roberta_origin import RobertaForMaskedLMPrompt
@@ -7,6 +8,7 @@ from framework.training_args import ModelEmotionArguments, RemainArgHfArgumentPa
 from framework.trainer import ModelEmotionTrainer
 from framework.glue_metrics import simple_accuracy, acc_and_f1
 from transformers import AutoConfig
+from transformers import RobertaTokenizerFast, RobertaConfig
 
 # 定义计算指标函数
 def compute_metrics(eval_pred):
@@ -41,9 +43,8 @@ tokenizer = AutoTokenizer.from_pretrained(
     "model/roberta-base",
     use_fast=False # False是使用python版本的分词器，速度较慢但是兼容性较好；True是使用Rust实现的快速分词器。
 )
-
-# config = AutoConfig.from_pretrained(args.backbone)
-# config.mask_token_id = tokenizer.mask_token_id
+# tokenizer.add_special_tokens({"additional_special_tokens": ["[PROMPT]"]})
+# prompt_token_id = tokenizer.convert_tokens_to_ids("[PROMPT]")
 
 # model = RobertaForMaskedLMPrompt.from_pretrained(
 #     args.backbone,
@@ -52,11 +53,20 @@ tokenizer = AutoTokenizer.from_pretrained(
 # )
 
 # 模型初始化
+# prompt_len = 100
+# prompt_token_id = tokenizer.convert_tokens_to_ids("[PROMPT]")
+
+# init_ids = torch.full((prompt_len,),        # ← shape = (100,)
+#                       prompt_token_id,
+#                       dtype=torch.long)
+
+config = RobertaConfig.from_pretrained("roberta-base")
 model = RobertaForMaskedLMPrompt.from_pretrained(
     "model/roberta-base",
     prompt_len=args.prompt_len,
-    num_labels=2
+    num_labels=2,
 )
+model.resize_token_embeddings(len(tokenizer))  
 
 # Trainer initialization 初始化训练器
 trainer = ModelEmotionTrainer(
