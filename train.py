@@ -2,7 +2,7 @@ import sys
 import os
 # from transformers import tokenizer
 from transformers import AutoTokenizer
-from framework import RobertaForMaskedLMPrompt
+from framework.roberta_origin import RobertaForMaskedLMPrompt
 from framework.training_args import ModelEmotionArguments, RemainArgHfArgumentParser
 from framework.trainer import ModelEmotionTrainer
 from framework.glue_metrics import simple_accuracy, acc_and_f1

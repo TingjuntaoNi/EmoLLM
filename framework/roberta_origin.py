@@ -28,7 +28,7 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         self.lm_head = RobertaLMHead(config)
 
         # The LM head weights require special treatment only when they are tied with the word embeddings
-        self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
+        #self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -64,47 +64,81 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        batch_size, seq_length = input_ids.shape
-
+        device = input_ids.device
+        batch_size, orig_seq_len = input_ids.shape
+        
         ## Add <MASK> to input_ids
-        mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(input_ids.device)
-        input_ids = torch.cat([mask_ids, input_ids], dim=1)
+        prompt_ids = torch.full((batch_size, self.prompt_len), 0, dtype=torch.long, device=input_ids.device)  # 占位
+        mask_ids = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=input_ids.device)
+        input_ids = torch.cat([prompt_ids, mask_ids, input_ids], dim=1)
         
         ## Add prefix to attention_mask
-        prompt_attention_mask = torch.ones(self.prompt_len + 1).repeat(batch_size, 1).to(attention_mask.device)
-        attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
+        prompt_attention_mask = torch.ones(batch_size, self.prompt_len, dtype=torch.long, device=device)
+        mask_attention_mask   = torch.ones(batch_size, 1, dtype=torch.long, device=device)
+        attention_mask = torch.cat([prompt_attention_mask, mask_attention_mask, attention_mask], dim=1)
 
+
+        # token_type_ids 补全 0（Roberta 不用 token_type，但还是要传同样长度）
+        if token_type_ids is not None:
+            prefix_token_type_ids = torch.zeros(batch_size, self.prompt_len + 1, dtype=torch.long, device=device)
+            token_type_ids = torch.cat([prefix_token_type_ids, token_type_ids], dim=1)
+        
+              
+        # position_ids 补全位置编号
+        if position_ids is None:
+            full_seq_len = self.prompt_len + 1 + orig_seq_len
+            position_ids = torch.arange(full_seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(batch_size, -1)
+        
+        
+        # === 4. sanity check ===
+        assert input_ids.shape[1] == attention_mask.shape[1], f"input_ids and attention_mask mismatch: {input_ids.shape[1]} vs {attention_mask.shape[1]}"
+        if token_type_ids is not None:
+            assert token_type_ids.shape[1] == input_ids.shape[1], f"token_type_ids mismatch: {token_type_ids.shape[1]} vs {input_ids.shape[1]}"
+        assert position_ids.shape[1] == input_ids.shape[1], f"position_ids mismatch: {position_ids.shape[1]} vs {input_ids.shape[1]}"
+
+        # === 5. debug 打印 ===
+        print("Final shapes → input_ids:", input_ids.shape, 
+            "attention_mask:", attention_mask.shape, 
+            "token_type_ids:", token_type_ids.shape if token_type_ids is not None else None,
+            "position_ids:", position_ids.shape)
+        
+        
         outputs = self.roberta(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
+            inputs_embeds=None,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        sequence_output = outputs[0]
-        prediction_scores = self.lm_head(sequence_output)
+        sequence_output = outputs[0] # [batch_size, seq_len, hidden_size]
+        prediction_scores = self.lm_head(sequence_output) # [batch_size, seq_len, vocab_size]
 
         # "positive":22173, "negative":33407
         # "yes":10932, "no":2362
         # '1': 134, '-': 12
         # 'true': 29225, 'false': 22303
-        mask_logits = prediction_scores[:, 0, :]
-        logits = torch.cat([mask_logits[:, 33407].unsqueeze(1), mask_logits[:, 22173].unsqueeze(1)], dim=1)
+        mask_position = self.prompt_len
+        mask_logits = prediction_scores[:, mask_position, :] # [batch_size, vocab_size]
+        
+        ## 从 vocab 中抽取用于二分类的 token
+        logits = torch.cat([
+            mask_logits[:, 33407].unsqueeze(1),  # "negative"
+            mask_logits[:, 22173].unsqueeze(1)   # "positive"
+        ], dim=1)
 
         masked_lm_loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            masked_lm_loss = loss_fct(logits.view(-1, self.config.num_labels), labels.view(-1))
+            masked_lm_loss = loss_fct(logits.view(-1, 2), labels.view(-1))
 
         if not return_dict:
-            output = (prediction_scores,) + outputs[2:]
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            return (masked_lm_loss, logits) if masked_lm_loss is not None else logits
 
         return MaskedLMOutput(
             loss=masked_lm_loss,
@@ -284,27 +318,20 @@ class RobertaEmbeddingsWarp(RobertaEmbeddings):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.word_embeddings(input_ids)
+        inputs_embeds = self.word_embeddings(input_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        embeddings = inputs_embeds + token_type_embeddings                # → [B, seq_len, H]
 
-        ## This is the original RoBERTa embedding, without positional embedding
-        embeddings = inputs_embeds + token_type_embeddings
-
-        ## Add prefix
+        # 插入 prompt
         prompt_ids = torch.arange(self.prompt_len).repeat(batch_size, 1).to(input_ids.device)
-        prompt_embedding = self.prompt_embedding(prompt_ids)
-
+        prompt_embedding = self.prompt_embedding(prompt_ids)              # → [B, prompt_len, H]
         embeddings = torch.cat([embeddings[:, :1, :], prompt_embedding, embeddings[:, 1:, :]], dim=1)
 
-        ## Then add positional embedding
-        if self.position_embedding_type == "absolute":
+        # 加 positional embedding（！！关键点在这里！！）
+        position_ids = torch.arange(embeddings.shape[1], dtype=torch.long, device=embeddings.device).unsqueeze(0).expand(batch_size, -1)
+        position_embeddings = self.position_embeddings(position_ids)
+        embeddings += position_embeddings
 
-            ## Add prefix for position embedding
-            position_ids = torch.arange(seq_length + self.prompt_len).repeat(batch_size, 1).to(input_ids.device)
-
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
