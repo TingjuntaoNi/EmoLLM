@@ -8,11 +8,13 @@ from framework.trainer import ModelEmotionTrainer
 from framework.glue_metrics import simple_accuracy, acc_and_f1
 from transformers import AutoConfig
 
+# 定义计算指标函数
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = logits.argmax(axis=-1)
     return acc_and_f1(preds, labels)
 
+# 解析命令行参数或 JSON 文件
 parser = RemainArgHfArgumentParser(ModelEmotionArguments)
 if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
     # If we pass only one argument to the script and it's the path to a json file,
@@ -34,9 +36,10 @@ else:
 #     args.backbone,
 #     use_fast=False
 # )
+# 初始化分词器
 tokenizer = AutoTokenizer.from_pretrained(
     "model/roberta-base",
-    use_fast=False
+    use_fast=False # False是使用python版本的分词器，速度较慢但是兼容性较好；True是使用Rust实现的快速分词器。
 )
 
 # config = AutoConfig.from_pretrained(args.backbone)
@@ -48,14 +51,14 @@ tokenizer = AutoTokenizer.from_pretrained(
 #     num_labels=2
 # )
 
+# 模型初始化
 model = RobertaForMaskedLMPrompt.from_pretrained(
     "model/roberta-base",
     prompt_len=args.prompt_len,
     num_labels=2
 )
 
-
-# Trainer initialization
+# Trainer initialization 初始化训练器
 trainer = ModelEmotionTrainer(
     args=args,
     model=model,

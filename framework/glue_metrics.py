@@ -120,8 +120,8 @@ def pearson_and_spearman(preds, labels):
 #             format="numpy",
 #         )
 
-    def _compute(self, predictions, references):
-        return {"accuracy": simple_accuracy(predictions, references)}
+#     def _compute(self, predictions, references):
+#         return {"accuracy": simple_accuracy(predictions, references)}
 
 def f1_multiclass_mathqa(predictions, references):
     return 100 * fbeta_score(
