@@ -28,7 +28,7 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
         self.lm_head = RobertaLMHead(config)
 
         # The LM head weights require special treatment only when they are tied with the word embeddings
-        # self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
+        self.update_keys_to_ignore(config, ["lm_head.decoder.weight"])
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -66,50 +66,16 @@ class RobertaForMaskedLMPrompt(RobertaPreTrainedModel):
 
         batch_size, seq_length = input_ids.shape
 
-        # ## Add <MASK> to input_ids
-        # mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(input_ids.device)
-        # input_ids = torch.cat([mask_ids, input_ids], dim=1)
-        # 我的改动
-        # # 1. 准备 prompt_len 个占位 token id（这里用 pad token id）
-        # pad_id = self.config.pad_token_id if hasattr(self.config, "pad_token_id") else 0
-        # prompt_ids = torch.full(
-        #     (batch_size, self.prompt_len),
-        #     pad_id,
-        #     dtype=input_ids.dtype,
-        #     device=input_ids.device
-        # )
-        # # 2. 然后是 MASK
-        # mask_ids = torch.full(
-        #     (batch_size, 1),
-        #     mask_id,
-        #     dtype=input_ids.dtype,
-        #     device=input_ids.device
-        # )
-        # # 3. 最后拼上原来的 input_ids
-        # input_ids = torch.cat([prompt_ids, mask_ids, input_ids], dim=1)
-
+        ## Add <MASK> to input_ids
+        mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(input_ids.device)
+        input_ids = torch.cat([mask_ids, input_ids], dim=1)
         
         ## Add prefix to attention_mask
         prompt_attention_mask = torch.ones(self.prompt_len + 1).repeat(batch_size, 1).to(attention_mask.device)
         attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
 
-        # 1) 文本 embedding
-        text_embeds   = self.roberta.embeddings.word_embeddings(input_ids)
-        # 2) 软提示 embedding
-        prompt_embeds = self.roberta.embeddings.prompt_embeddings.weight.unsqueeze(0).expand(batch_size, -1, -1)
-        # 3) [MASK] embedding
-        mask_tensor   = torch.full((batch_size,1), mask_id, dtype=torch.long, device=device)
-        mask_embeds   = self.roberta.embeddings.word_embeddings(mask_tensor)
-        # 4) 拼 inputs_embeds
-        inputs_embeds = torch.cat([prompt_embeds, mask_embeds, text_embeds], dim=1)
-        # 5) 拼 attention_mask
-        prompt_attn   = torch.ones(batch_size, prompt_len, device=device)
-        mask_attn     = torch.ones(batch_size, 1, device=device)
-        attention_mask= torch.cat([prompt_attn, mask_attn, attention_mask], dim=1)
-                      
-        
         outputs = self.roberta(
-            # input_ids,
+            input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -180,8 +146,6 @@ class RobertaWarp(RobertaPreTrainedModel):
 
         self.freeze_lm()
 
-        self.prompt_embeddings = nn.Embedding(prompt_len, config.hidden_size)
-
     def freeze_lm(self):
         for name, param in self.named_parameters():
             if not ('prompt_embedding' in name or 'label_embedding' in name):
@@ -215,34 +179,16 @@ class RobertaWarp(RobertaPreTrainedModel):
 
         batch_size, seq_length = input_ids.shape
 
-        # ## Add <MASK> to input_ids
-        # mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(input_ids.device)
-        # input_ids = torch.cat([mask_ids, input_ids], dim=1)
+        ## Add <MASK> to input_ids
+        mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(input_ids.device)
+        input_ids = torch.cat([mask_ids, input_ids], dim=1)
         
-        # ## Add prefix to attention_mask
-        # prompt_attention_mask = torch.ones(self.prompt_len + 1).repeat(batch_size, 1).to(attention_mask.device)
-        # attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
+        ## Add prefix to attention_mask
+        prompt_attention_mask = torch.ones(self.prompt_len + 1).repeat(batch_size, 1).to(attention_mask.device)
+        attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
         
-        # 1️⃣ text embedding
-        text_embeds = self.roberta.embeddings.word_embeddings(input_ids)
-
-        # 2️⃣ prompt embedding
-        prompt_embeds = self.roberta.prompt_embeddings.weight.unsqueeze(0).expand(batch_size, -1, -1)
-
-        # 3️⃣ mask embedding
-        mask_tensor = torch.full((batch_size, 1), mask_id, dtype=torch.long, device=input_ids.device)
-        mask_embeds = self.roberta.embeddings.word_embeddings(mask_tensor)
-
-        # 4️⃣ 拼 inputs_embeds
-        inputs_embeds = torch.cat([prompt_embeds, mask_embeds, text_embeds], dim=1)
-
-        # 5️⃣ 拼 attention_mask
-        prompt_attn = torch.ones(batch_size, self.prompt_len, device=input_ids.device)
-        mask_attn   = torch.ones(batch_size, 1, device=input_ids.device)
-        attention_mask = torch.cat([prompt_attn, mask_attn, attention_mask], dim=1)
-
         outputs = self.roberta(
-            # input_ids,
+            input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -363,40 +309,15 @@ class RobertaEmbeddingsWarp(RobertaEmbeddings):
         embeddings = self.dropout(embeddings)
         return embeddings
 
-# class RobertaModelWarp(RobertaModel):
-#     """
-#     Difference from Huggingface source code: Use new embedding layer instead of original RobertaEmbeddings
-#     """
-
-#     _keys_to_ignore_on_load_missing = [r"position_ids"]
-
-#     def __init__(self, config, prompt_len, init_ids=None, add_pooling_layer=True):
-#         super().__init__(config)
-#         self.config = config
-
-#         self.embeddings = RobertaEmbeddingsWarp(config, prompt_len, init_ids)
-
 class RobertaModelWarp(RobertaModel):
+    """
+    Difference from Huggingface source code: Use new embedding layer instead of original RobertaEmbeddings
+    """
+
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def __init__(self, config, prompt_len, init_ids=None, add_pooling_layer=True):
         super().__init__(config)
         self.config = config
-        self.prompt_len = prompt_len
 
-        # 1. 原始（可能定制化的）Embeddings
         self.embeddings = RobertaEmbeddingsWarp(config, prompt_len, init_ids)
-
-        # 2. 可训练的 Soft Prompt Embeddings
-        self.prompt_embeddings = nn.Embedding(prompt_len, config.hidden_size)
-        if init_ids is not None:
-            with torch.no_grad():
-                init_embeds = self.embeddings.word_embeddings(init_ids)
-                self.prompt_embeddings.weight.copy_(init_embeds)
-
-        # 3. Pooler（可选）
-        if add_pooling_layer:
-            self.pooler = RobertaPooler(config)
-
-        # 4. 新增模块权重初始化
-        self.init_weights()
