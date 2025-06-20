@@ -184,6 +184,8 @@ class RobertaWarp(RobertaPreTrainedModel):
         self.roberta = RobertaModelWarp(config, prompt_len, init_ids, add_pooling_layer=False)
         self.lm_decoder = RobertaLMHeadWarp(config)
         self.label_embedding = nn.Linear(config.hidden_size, config.num_labels)
+        if not hasattr(config, "num_labels") or config.num_labels is None:
+            config.num_labels = 2
         self.sigm = nn.Sigmoid()
 
         self.init_weights()
@@ -192,7 +194,7 @@ class RobertaWarp(RobertaPreTrainedModel):
 
     def freeze_lm(self):
         for name, param in self.named_parameters():
-            if not ('prompt_embedding' in name or 'label_embedding' in name):
+            if not (('prompt_embedding' in name) or ('prompt_embeddings' in name) or ('label_embedding' in name)):
                 param.requires_grad = False
 
     def get_output_embeddings(self):
@@ -230,21 +232,30 @@ class RobertaWarp(RobertaPreTrainedModel):
         else:
             device = torch.device("cpu")
 
+        # 0) device、batch_size 与 attention_mask 逻辑保持不变
         batch_size, seq_length = input_ids.shape
 
-        ## Add <MASK> to input_ids
-        mask_ids = torch.tensor([mask_id]).repeat(batch_size, 1).to(device)
-        input_ids = torch.cat([mask_ids, input_ids], dim=1)
-        
-        # ## Add prefix to attention_mask
-        # prompt_attention_mask = torch.ones(self.prompt_len + 1).repeat(batch_size, 1).to(attention_mask.device)
-        # attention_mask = torch.cat([prompt_attention_mask, attention_mask], dim=1)
-        prompt_attention_mask = torch.ones(batch_size, self.prompt_len, device=attention_mask.device)
-        mask_attention_mask   = torch.ones(batch_size, 1, device=attention_mask.device)
-        attention_mask = torch.cat([prompt_attention_mask, mask_attention_mask, attention_mask], dim=1)
+        # 1) 原句的 token 嵌入
+        text_embeds = self.roberta.embeddings.word_embeddings(input_ids)
+
+        # 2) prompt 嵌入
+        prompt_ids   = torch.arange(self.prompt_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        prompt_embeds = self.roberta.embeddings.prompt_embedding(prompt_ids)      # (B, P, H)
+
+        # 3) mask 嵌入
+        mask_embeds = self.roberta.embeddings.word_embeddings(
+            torch.full((batch_size, 1), mask_id, dtype=torch.long, device=device)
+        )
+
+        # 4) 拼接：Prompt  →  <mask>  →  原句
+        inputs_embeds = torch.cat([prompt_embeds, mask_embeds, text_embeds], dim=1)
+
+        # 5) attention_mask 同步扩展
+        prompt_mask = torch.ones(batch_size, self.prompt_len, device=device)
+        mask_mask   = torch.ones(batch_size, 1, device=device)
+        attention_mask = torch.cat([prompt_mask, mask_mask, attention_mask], dim=1)
         
         outputs = self.roberta(
-            input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -257,25 +268,20 @@ class RobertaWarp(RobertaPreTrainedModel):
             return_dict=True,
         )
 
-        hidden_states = outputs.last_hidden_state[:, 0, :]
-
-        lm_score = self.lm_decoder(hidden_states)
-        logits = self.label_embedding(lm_score)
-        # logits = self.sigm(logits)
+        #hidden_states = outputs.last_hidden_state[:, 0, :]
+        mask_index = self.prompt_len
+        hidden_states = outputs.last_hidden_state[:, mask_index, :]
+        logits = self.label_embedding(hidden_states)
 
         # print('shape', outputs.last_hidden_state.shape, mask.shape, hidden_states.shape, lm_score.shape, logits.shape, labels.shape)
 
-        masked_lm_loss = None
+        loss = None
         if labels is not None:
-            # label_emb = self.label_embedding(labels)
-            # loss_fct = nn.BCELoss()
+            labels = labels.view(-1).long()            # (B,)
             loss_fct = nn.CrossEntropyLoss()
-            masked_lm_loss = loss_fct(logits.view(-1, self.config.num_labels), labels)
+            loss = loss_fct(logits, labels)
 
-        return MaskedLMOutput(
-            loss=masked_lm_loss,
-            logits=logits,
-        )
+        return MaskedLMOutput(loss=loss, logits=logits)
     
     def tie_weights(self):
         """No need to tie input and output embeddings."""
